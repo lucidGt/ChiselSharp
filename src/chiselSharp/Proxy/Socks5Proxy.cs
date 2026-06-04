@@ -38,6 +38,7 @@ namespace ChiselSharp.Proxy
         private const byte REP_CONN_REFUSED = 0x05;
         private const byte REP_CMD_NOT_SUPPORTED = 0x07;
         private const byte REP_ADDR_NOT_SUPPORTED = 0x08;
+        private const int ConnectTimeoutMs = 3000;
 
         public Socks5Proxy(Multiplexer mux, bool isReverse)
         {
@@ -238,9 +239,9 @@ namespace ChiselSharp.Proxy
             Exception connectError = null;
             try
             {
-                // ConnectAsync not available in .NET 4.5, use Task.Run with synchronous Connect
                 destClient = new TcpClient();
-                await Compat.Run(() => destClient.Connect(destAddr, destPort));
+                destClient.NoDelay = true;
+                await Compat.ConnectTcpAsync(destClient, destAddr, destPort, ConnectTimeoutMs);
 
                 // Send success reply
                 var destStream = destClient.GetStream();

@@ -16,6 +16,7 @@ namespace ChiselSharp.Tunnels
         private readonly bool _isReverse;
         private TcpListener _listener;
         private bool _disposed;
+        private const int ConnectTimeoutMs = 5000;
 
         public TcpTunnel(Multiplexer mux, RemoteSpec spec, bool isServer, bool isReverse)
         {
@@ -213,7 +214,8 @@ namespace ChiselSharp.Tunnels
             {
                 // Connect to the actual destination
                 tcpClient = new TcpClient();
-                await Compat.Run(() => tcpClient.Connect(remoteHost, remotePort));
+                tcpClient.NoDelay = true;
+                await Compat.ConnectTcpAsync(tcpClient, remoteHost, remotePort, ConnectTimeoutMs);
                 Logger.Debug("Connected to target " + remoteHost + ":" + remotePort);
 
                 // Send ACK to signal the peer that the channel is accepted and ready

@@ -107,6 +107,7 @@
     <Compile Include="Program.cs" />
     <Compile Include="Utils\Logger.cs" />
     <Compile Include="Utils\Backoff.cs" />
+    <Compile Include="Utils\AsyncLimiter.cs" />
     <Compile Include="Utils\JsonHelper.cs" />
     <Compile Include="Utils\Net40Compat.cs" />
     <Compile Include="Settings\Config.cs" />

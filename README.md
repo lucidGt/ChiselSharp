@@ -52,6 +52,12 @@ v4.0 and run in older Windows environments where newer framework APIs may not be
 - Batches SSH channel window adjustments so short-lived SOCKS connections do not race channel close.
 - Bounds concurrent client-side forward channels to avoid overloading a single native chisel session
   during large SOCKS request bursts.
+- Bounds inbound SOCKS channel handling on both client and server paths so failed target bursts do
+  not exhaust the SSH session.
+- Adds TCP target dial timeouts for SOCKS, direct TCP, reverse TCP, WebSocket connect, and legacy
+  tunnel helper paths.
+- Sends SSH channel-open confirmations before dispatching channel handlers, preserving packet order
+  under high concurrent native chisel channel opens.
 - Moved remaining unavoidable blocking channel receive loops to long-running tasks to reduce
   ThreadPool starvation.
 - Added pipe-drain behavior before closing SSH channels to reduce close races and invalid-channel
@@ -83,6 +89,11 @@ per scenario:
 - C# client to native server, reverse SOCKS tunnel (`R:socks`): passed.
 - Native client to C# server, reverse SOCKS tunnel (`R:socks`): passed.
 - High-burst SOCKS regression tests with 200 concurrent requests across repeated waves: passed.
+- Failed-target SOCKS storm tests with native chisel 1.10.1 passed in both directions:
+  - Native server + C# client reverse SOCKS: 600 failed CONNECT attempts followed by 200 successful
+    proxied echo requests.
+  - C# server + native client forward SOCKS: 600 failed CONNECT attempts followed by 200 successful
+    proxied echo requests.
 
 UDP and TLS/mTLS paths are implemented or parsed in parts of the project, but they have not received
 the same full native interoperability load audit as TCP and SOCKS.

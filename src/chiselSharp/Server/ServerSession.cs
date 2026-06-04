@@ -26,6 +26,11 @@ namespace ChiselSharp.Server
         private SshConnection _connection;
         private bool _disposed;
         private const int PipeDrainTimeoutMs = 2000;
+        private const int RemoteConnectTimeoutMs = 5000;
+        private const int SocksConnectTimeoutMs = 3000;
+        private const int MaxConcurrentSocksChannels = 256;
+        private readonly AsyncLimiter _socksChannelLimiter =
+            new AsyncLimiter(MaxConcurrentSocksChannels);
 
         private uint _sessionChannelId;
         private Dictionary<string, string> _envVars;
@@ -700,7 +705,7 @@ namespace ChiselSharp.Server
                 // Connect to the target
                 tcpClient = new TcpClient();
                 tcpClient.NoDelay = true;
-                await Compat.ConnectTcpAsync(tcpClient, host, port);
+                await Compat.ConnectTcpAsync(tcpClient, host, port, RemoteConnectTimeoutMs);
 
                 // Bidirectional pipe between SSH channel and TCP connection
                 NetworkStream stream = tcpClient.GetStream();
@@ -754,7 +759,7 @@ namespace ChiselSharp.Server
 
                 tcpClient = new TcpClient();
                 tcpClient.NoDelay = true;
-                await Compat.ConnectTcpAsync(tcpClient, host, port);
+                await Compat.ConnectTcpAsync(tcpClient, host, port, RemoteConnectTimeoutMs);
 
                 NetworkStream stream = tcpClient.GetStream();
                 Task task1 = PipeSshToTcp(localChannelId, stream);
@@ -819,24 +824,32 @@ namespace ChiselSharp.Server
 
         private async Task HandleSocksChannel(uint channelId)
         {
+            IDisposable permit = null;
             TcpClient tcpClient = null;
             ChannelStream channelStream = null;
             bool sendFailureReply = false;
             try
             {
-                channelStream = new ChannelStream(_connection, channelId);
-                SocksConnectRequest request = await ReadSocksConnectRequest(channelStream);
-                if (request != null)
+                if (!_socksChannelLimiter.TryEnter(out permit))
                 {
-                    tcpClient = new TcpClient();
-                    tcpClient.NoDelay = true;
-                    await Compat.ConnectTcpAsync(tcpClient, request.Host, request.Port);
-                    await WriteSocksReply(channelStream, 0);
+                    Logger.Debug("SOCKS channel limit reached");
+                }
+                else
+                {
+                    channelStream = new ChannelStream(_connection, channelId);
+                    SocksConnectRequest request = await ReadSocksConnectRequest(channelStream);
+                    if (request != null)
+                    {
+                        tcpClient = new TcpClient();
+                        tcpClient.NoDelay = true;
+                        await Compat.ConnectTcpAsync(tcpClient, request.Host, request.Port, SocksConnectTimeoutMs);
+                        await WriteSocksReply(channelStream, 0);
 
-                    NetworkStream tcpStream = tcpClient.GetStream();
-                    Task task1 = PipeStreamToTcp(channelStream, tcpStream);
-                    Task task2 = PipeTcpToSsh(tcpStream, channelId);
-                    await WaitForPipeTasks(task1, task2, delegate { try { tcpStream.Close(); } catch { } });
+                        NetworkStream tcpStream = tcpClient.GetStream();
+                        Task task1 = PipeStreamToTcp(channelStream, tcpStream);
+                        Task task2 = PipeTcpToSsh(tcpStream, channelId);
+                        await WaitForPipeTasks(task1, task2, delegate { try { tcpStream.Close(); } catch { } });
+                    }
                 }
             }
             catch (Exception ex)
@@ -852,6 +865,14 @@ namespace ChiselSharp.Server
             if (tcpClient != null)
             {
                 try { tcpClient.Close(); } catch { }
+            }
+            if (permit != null)
+            {
+                permit.Dispose();
+            }
+            if (channelStream != null)
+            {
+                try { channelStream.Dispose(); } catch { }
             }
             if (_connection != null)
             {

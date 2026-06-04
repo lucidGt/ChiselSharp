@@ -696,7 +696,7 @@ namespace ChiselSharp.SSH
                     switch (msgType)
                     {
                         case SshMsg.SSH_MSG_CHANNEL_OPEN:
-                            HandleChannelOpen(payload);
+                            await HandleChannelOpenAsync(payload);
                             break;
 
                         case SshMsg.SSH_MSG_CHANNEL_OPEN_CONFIRMATION:
@@ -792,7 +792,7 @@ namespace ChiselSharp.SSH
 
         // ===================== Message Handlers =====================
 
-        private void HandleChannelOpen(byte[] payload)
+        private async Task HandleChannelOpenAsync(byte[] payload)
         {
             try
             {
@@ -837,8 +837,7 @@ namespace ChiselSharp.SSH
                     localId,
                     SshChannel.DefaultWindowSize,
                     SshChannel.DefaultMaxPacket);
-                // Fire-and-forget: send confirmation packet
-                Task unused = _transport.SendPacketAsync(confirm);
+                await _transport.SendPacketAsync(confirm);
 
                 // Notify listener
                 var handler = IncomingChannelOpen;

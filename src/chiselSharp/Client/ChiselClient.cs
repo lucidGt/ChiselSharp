@@ -27,9 +27,14 @@ namespace ChiselSharp.Client
         private readonly Dictionary<int, TcpListener> _listeners = new Dictionary<int, TcpListener>();
         private readonly object _listenersLock = new object();
         private const int PipeDrainTimeoutMs = 2000;
+        private const int RemoteConnectTimeoutMs = 5000;
+        private const int SocksConnectTimeoutMs = 3000;
         private const int MaxConcurrentForwardChannels = 32;
+        private const int MaxConcurrentSocksChannels = 256;
         private readonly AsyncLimiter _forwardChannelLimiter =
             new AsyncLimiter(MaxConcurrentForwardChannels);
+        private readonly AsyncLimiter _socksChannelLimiter =
+            new AsyncLimiter(MaxConcurrentSocksChannels);
 
         // Raw WebSocket stream for SSH transport.
 
@@ -227,7 +232,7 @@ namespace ChiselSharp.Client
             {
                 var client = new TcpClient();
                 client.NoDelay = true;
-                await Compat.ConnectTcpAsync(client, host, port);
+                await Compat.ConnectTcpAsync(client, host, port, RemoteConnectTimeoutMs);
                 var ns = client.GetStream();
                 await PipeSshToTcp(channelId, ns);
                 try { client.Close(); } catch { }
@@ -338,25 +343,33 @@ namespace ChiselSharp.Client
 
         private async Task HandleSocksChannel(uint channelId)
         {
+            IDisposable permit = null;
             TcpClient tcpClient = null;
             ChannelStream channelStream = null;
             bool sendFailureReply = false;
 
             try
             {
-                channelStream = new ChannelStream(_sshConn, channelId);
-                SocksConnectRequest request = await ReadSocksConnectRequest(channelStream);
-                if (request != null)
+                if (!_socksChannelLimiter.TryEnter(out permit))
                 {
-                    tcpClient = new TcpClient();
-                    tcpClient.NoDelay = true;
-                    await Compat.ConnectTcpAsync(tcpClient, request.Host, request.Port);
-                    await WriteSocksReply(channelStream, 0);
+                    Logger.Debug("SOCKS channel limit reached");
+                }
+                else
+                {
+                    channelStream = new ChannelStream(_sshConn, channelId);
+                    SocksConnectRequest request = await ReadSocksConnectRequest(channelStream);
+                    if (request != null)
+                    {
+                        tcpClient = new TcpClient();
+                        tcpClient.NoDelay = true;
+                        await Compat.ConnectTcpAsync(tcpClient, request.Host, request.Port, SocksConnectTimeoutMs);
+                        await WriteSocksReply(channelStream, 0);
 
-                    NetworkStream tcpStream = tcpClient.GetStream();
-                    Task fromChannel = PipeStreamToTcp(channelStream, tcpStream);
-                    Task fromTcp = PipeTcpToSsh(tcpStream, channelId);
-                    await WaitForPipeTasks(fromChannel, fromTcp, delegate { try { tcpStream.Close(); } catch { } });
+                        NetworkStream tcpStream = tcpClient.GetStream();
+                        Task fromChannel = PipeStreamToTcp(channelStream, tcpStream);
+                        Task fromTcp = PipeTcpToSsh(tcpStream, channelId);
+                        await WaitForPipeTasks(fromChannel, fromTcp, delegate { try { tcpStream.Close(); } catch { } });
+                    }
                 }
             }
             catch (Exception ex)
@@ -373,6 +386,10 @@ namespace ChiselSharp.Client
             if (tcpClient != null)
             {
                 try { tcpClient.Close(); } catch { }
+            }
+            if (permit != null)
+            {
+                permit.Dispose();
             }
             if (channelStream != null)
             {
@@ -691,73 +708,6 @@ namespace ChiselSharp.Client
                 _disposed = true;
                 _buffer = null;
                 base.Dispose(disposing);
-            }
-        }
-
-        private sealed class AsyncLimiter
-        {
-            private readonly object _syncRoot = new object();
-            private readonly Queue<TaskCompletionSource<IDisposable>> _waiters =
-                new Queue<TaskCompletionSource<IDisposable>>();
-            private int _available;
-
-            public AsyncLimiter(int limit)
-            {
-                _available = limit;
-            }
-
-            public Task<IDisposable> EnterAsync()
-            {
-                lock (_syncRoot)
-                {
-                    if (_available > 0)
-                    {
-                        _available--;
-                        return Compat.FromResult<IDisposable>(new Releaser(this));
-                    }
-
-                    var waiter = new TaskCompletionSource<IDisposable>();
-                    _waiters.Enqueue(waiter);
-                    return waiter.Task;
-                }
-            }
-
-            private void Release()
-            {
-                TaskCompletionSource<IDisposable> waiter = null;
-                lock (_syncRoot)
-                {
-                    if (_waiters.Count > 0)
-                    {
-                        waiter = _waiters.Dequeue();
-                    }
-                    else
-                    {
-                        _available++;
-                    }
-                }
-
-                if (waiter != null)
-                    waiter.TrySetResult(new Releaser(this));
-            }
-
-            private sealed class Releaser : IDisposable
-            {
-                private AsyncLimiter _owner;
-
-                public Releaser(AsyncLimiter owner)
-                {
-                    _owner = owner;
-                }
-
-                public void Dispose()
-                {
-                    AsyncLimiter owner = _owner;
-                    if (owner == null)
-                        return;
-                    _owner = null;
-                    owner.Release();
-                }
             }
         }
 

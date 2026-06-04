@@ -10,6 +10,8 @@
   address handling.
 - Added client-side channel stream support for reverse SOCKS channel IO.
 - Added .NET Framework v4.0 compatibility shims for async/task APIs used by the tunnel code.
+- Added shared async concurrency limiting for burst-sensitive tunnel paths.
+- Added TCP connect timeout helpers for .NET Framework 4.x target dials.
 
 ### Changed
 
@@ -23,6 +25,12 @@
   closed short-lived channels.
 - Added a client-side forward-channel concurrency limiter so bursty SOCKS clients queue locally
   instead of overloading one native chisel SSH session.
+- Added inbound SOCKS channel limits on client and server paths to keep failed CONNECT bursts from
+  exhausting a native chisel session.
+- Added bounded TCP target dials for SOCKS, reverse TCP, direct TCP, WebSocket, and legacy tunnel
+  helper paths.
+- Serialized SSH channel-open confirmation before channel handler dispatch so close/failure paths
+  cannot overtake confirmation packets during high concurrent native chisel opens.
 - Moved remaining unavoidable blocking SSH channel receive paths onto long-running tasks to reduce
   ThreadPool starvation.
 - Drained bidirectional pipe tasks before closing SSH channels to reduce close races under load.
@@ -66,3 +74,8 @@
   - C# client to native server reverse SOCKS (`R:socks`).
   - Native client to C# server reverse SOCKS (`R:socks`).
   - Native client to C# server forward SOCKS.
+- Failed-target SOCKS storm regression tests passed with native chisel 1.10.1:
+  - Native server + C# client reverse SOCKS: 600 failed CONNECT attempts, then 1 recovery request,
+    then 200 successful proxied echo requests.
+  - C# server + native client forward SOCKS: 600 failed CONNECT attempts, then 1 recovery request,
+    then 200 successful proxied echo requests.

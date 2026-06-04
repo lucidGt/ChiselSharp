@@ -20,6 +20,7 @@ namespace ChiselSharp.Transport
     public class WebSocketFrameStream : Stream, IAsyncCompatStream
     {
         private const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        private const int ConnectTimeoutMs = 10000;
 
         private readonly Stream _stream;
         private readonly TcpClient _client;
@@ -102,7 +103,7 @@ namespace ChiselSharp.Transport
 
             TcpClient client = new TcpClient();
             client.NoDelay = true;
-            await Compat.ConnectTcpAsync(client, uri.Host, port);
+            await Compat.ConnectTcpAsync(client, uri.Host, port, ConnectTimeoutMs);
 
             Stream stream = client.GetStream();
             if (uri.Scheme == "wss")

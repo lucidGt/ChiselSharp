@@ -490,9 +490,62 @@ namespace ChiselSharp.Utils
             return Task.Factory.FromAsync(client.BeginConnect(host, port, null, null), client.EndConnect);
         }
 
+        public static async Task ConnectTcpAsync(TcpClient client, string host, int port, int timeoutMs)
+        {
+            if (timeoutMs <= 0)
+            {
+                await ConnectTcpAsync(client, host, port);
+                return;
+            }
+
+            Task connectTask = ConnectTcpAsync(client, host, port);
+            Task completed = await WhenAny(connectTask, Delay(timeoutMs));
+            if (completed != connectTask)
+            {
+                ObserveFault(connectTask);
+                TryClose(client);
+                throw new TimeoutException("Timed out connecting to " + host + ":" + port);
+            }
+
+            await connectTask;
+        }
+
         public static Task ConnectTcpAsync(TcpClient client, System.Net.IPAddress address, int port)
         {
             return Task.Factory.FromAsync(client.BeginConnect(address, port, null, null), client.EndConnect);
+        }
+
+        public static async Task ConnectTcpAsync(TcpClient client, System.Net.IPAddress address, int port, int timeoutMs)
+        {
+            if (timeoutMs <= 0)
+            {
+                await ConnectTcpAsync(client, address, port);
+                return;
+            }
+
+            Task connectTask = ConnectTcpAsync(client, address, port);
+            Task completed = await WhenAny(connectTask, Delay(timeoutMs));
+            if (completed != connectTask)
+            {
+                ObserveFault(connectTask);
+                TryClose(client);
+                throw new TimeoutException("Timed out connecting to " + address + ":" + port);
+            }
+
+            await connectTask;
+        }
+
+        private static void ObserveFault(Task task)
+        {
+            task.ContinueWith(delegate(Task completed)
+            {
+                AggregateException ignored = completed.Exception;
+            }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        private static void TryClose(TcpClient client)
+        {
+            try { client.Close(); } catch { }
         }
     }
 }
