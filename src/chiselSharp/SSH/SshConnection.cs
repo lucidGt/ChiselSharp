@@ -22,6 +22,7 @@ namespace ChiselSharp.SSH
         public bool IsOpen { get; set; }
         public uint RemoteWindow { get; set; }   // Peer's window remaining
         public uint LocalWindow { get; set; }    // Our window remaining
+        public uint PendingWindowAdjust { get; set; }
         public uint RemoteMaxPacket { get; set; }
         public object SyncRoot { get; private set; }
 
@@ -31,6 +32,7 @@ namespace ChiselSharp.SSH
         // Event for incoming data notification
         public TaskCompletionSource<bool> OpenConfirmationTcs { get; set; }
         public TaskCompletionSource<bool> WindowAdjustTcs { get; set; }
+        public TaskCompletionSource<bool> IncomingDataTcs { get; set; }
 
         public SshChannel(uint localId, string type)
         {
@@ -40,6 +42,7 @@ namespace ChiselSharp.SSH
             IsOpen = false;
             RemoteWindow = DefaultWindowSize;
             LocalWindow = DefaultWindowSize;
+            PendingWindowAdjust = 0;
             RemoteMaxPacket = DefaultMaxPacket;
             SyncRoot = new object();
             IncomingData = new BlockingCollection<byte[]>(new ConcurrentQueue<byte[]>());
@@ -581,13 +584,17 @@ namespace ChiselSharp.SSH
 
             if (channel != null)
             {
+                TaskCompletionSource<bool> incomingDataTcs = null;
                 lock (channel.SyncRoot)
                 {
                     channel.IsOpen = false;
                     if (channel.WindowAdjustTcs != null)
                         channel.WindowAdjustTcs.TrySetResult(true);
+                    incomingDataTcs = channel.IncomingDataTcs;
                 }
                 try { channel.IncomingData.CompleteAdding(); } catch { }
+                if (incomingDataTcs != null)
+                    incomingDataTcs.TrySetResult(true);
 
                 if (channel.RemoteId != 0)
                 {
@@ -633,6 +640,40 @@ namespace ChiselSharp.SSH
             {
                 // Collection is complete (channel closed)
                 return null;
+            }
+        }
+
+        /// <summary>
+        /// Receive data from a channel without dedicating a blocked worker thread.
+        /// Returns null if the channel is closed.
+        /// </summary>
+        public async Task<byte[]> ReceiveChannelDataAsync(uint localChannelId)
+        {
+            while (true)
+            {
+                SshChannel channel = FindChannel(localChannelId);
+                if (channel == null)
+                    return null;
+
+                byte[] data;
+                Task waitTask;
+                lock (channel.SyncRoot)
+                {
+                    if (channel.IncomingData.TryTake(out data))
+                    {
+                        AdjustLocalWindow(channel, data.Length);
+                        return data;
+                    }
+
+                    if (!channel.IsOpen || channel.IncomingData.IsCompleted)
+                        return null;
+
+                    if (channel.IncomingDataTcs == null || channel.IncomingDataTcs.Task.IsCompleted)
+                        channel.IncomingDataTcs = new TaskCompletionSource<bool>();
+                    waitTask = channel.IncomingDataTcs.Task;
+                }
+
+                await waitTask;
             }
         }
 
@@ -726,6 +767,7 @@ namespace ChiselSharp.SSH
             }
 
             // Mark all channels as closed
+            List<TaskCompletionSource<bool>> incomingSignals = new List<TaskCompletionSource<bool>>();
             lock (_channelsLock)
             {
                 foreach (var kvp in _channels.Values)
@@ -735,12 +777,16 @@ namespace ChiselSharp.SSH
                         kvp.IsOpen = false;
                         if (kvp.WindowAdjustTcs != null)
                             kvp.WindowAdjustTcs.TrySetResult(true);
+                        if (kvp.IncomingDataTcs != null)
+                            incomingSignals.Add(kvp.IncomingDataTcs);
                     }
                     kvp.OpenConfirmationTcs.TrySetException(new Exception("SSH connection closed"));
                     try { kvp.IncomingData.CompleteAdding(); } catch { }
                 }
                 _channels.Clear();
             }
+            foreach (var signal in incomingSignals)
+                signal.TrySetResult(true);
             IsClosed = true;
         }
 
@@ -893,14 +939,19 @@ namespace ChiselSharp.SSH
             SshChannel channel = FindChannel(recipientChannel);
             if (channel != null && channel.IsOpen)
             {
+                TaskCompletionSource<bool> incomingDataTcs = null;
                 lock (channel.SyncRoot)
                 {
                     if (channel.LocalWindow >= data.Length)
                         channel.LocalWindow -= (uint)data.Length;
                     else
                         channel.LocalWindow = 0;
+
+                    try { channel.IncomingData.Add(data); } catch (InvalidOperationException) { }
+                    incomingDataTcs = channel.IncomingDataTcs;
                 }
-                try { channel.IncomingData.Add(data); } catch (InvalidOperationException) { }
+                if (incomingDataTcs != null)
+                    incomingDataTcs.TrySetResult(true);
             }
         }
 
@@ -912,7 +963,14 @@ namespace ChiselSharp.SSH
             SshChannel channel = FindChannel(recipientChannel);
             if (channel != null)
             {
-                try { channel.IncomingData.CompleteAdding(); } catch { }
+                TaskCompletionSource<bool> incomingDataTcs = null;
+                lock (channel.SyncRoot)
+                {
+                    try { channel.IncomingData.CompleteAdding(); } catch { }
+                    incomingDataTcs = channel.IncomingDataTcs;
+                }
+                if (incomingDataTcs != null)
+                    incomingDataTcs.TrySetResult(true);
             }
         }
 
@@ -930,13 +988,17 @@ namespace ChiselSharp.SSH
 
             if (channel != null)
             {
+                TaskCompletionSource<bool> incomingDataTcs = null;
                 lock (channel.SyncRoot)
                 {
                     channel.IsOpen = false;
                     if (channel.WindowAdjustTcs != null)
                         channel.WindowAdjustTcs.TrySetResult(true);
+                    incomingDataTcs = channel.IncomingDataTcs;
                 }
                 try { channel.IncomingData.CompleteAdding(); } catch { }
+                if (incomingDataTcs != null)
+                    incomingDataTcs.TrySetResult(true);
 
                 // Send close response
                 if (channel.RemoteId != 0)
@@ -1068,7 +1130,7 @@ namespace ChiselSharp.SSH
             if (channel == null || bytesConsumed <= 0)
                 return;
 
-            bool shouldSend = false;
+            uint bytesToAdjust = 0;
             lock (channel.SyncRoot)
             {
                 if (channel.RemoteId == 0)
@@ -1076,12 +1138,20 @@ namespace ChiselSharp.SSH
 
                 ulong newWindow = (ulong)channel.LocalWindow + (uint)bytesConsumed;
                 channel.LocalWindow = newWindow > uint.MaxValue ? uint.MaxValue : (uint)newWindow;
-                shouldSend = channel.IsOpen;
+
+                ulong pending = (ulong)channel.PendingWindowAdjust + (uint)bytesConsumed;
+                channel.PendingWindowAdjust = pending > uint.MaxValue ? uint.MaxValue : (uint)pending;
+                if (channel.IsOpen &&
+                    channel.PendingWindowAdjust >= SshChannel.DefaultWindowSize / 4)
+                {
+                    bytesToAdjust = channel.PendingWindowAdjust;
+                    channel.PendingWindowAdjust = 0;
+                }
             }
 
-            if (shouldSend)
+            if (bytesToAdjust > 0)
             {
-                Task unused = SendChannelWindowAdjustAsync(channel, (uint)bytesConsumed);
+                Task unused = SendChannelWindowAdjustAsync(channel, bytesToAdjust);
             }
         }
 
@@ -1093,7 +1163,7 @@ namespace ChiselSharp.SSH
             uint remoteId;
             lock (channel.SyncRoot)
             {
-                if (channel.RemoteId == 0)
+                if (!channel.IsOpen || channel.RemoteId == 0)
                     return;
                 remoteId = channel.RemoteId;
             }
@@ -1119,13 +1189,17 @@ namespace ChiselSharp.SSH
             if (channel == null)
                 return;
 
+            TaskCompletionSource<bool> incomingDataTcs = null;
             lock (channel.SyncRoot)
             {
                 channel.IsOpen = false;
                 if (channel.WindowAdjustTcs != null)
                     channel.WindowAdjustTcs.TrySetResult(true);
+                incomingDataTcs = channel.IncomingDataTcs;
             }
             try { channel.IncomingData.CompleteAdding(); } catch { }
+            if (incomingDataTcs != null)
+                incomingDataTcs.TrySetResult(true);
         }
 
         private static byte[] BuildChannelOpenConfirm(uint recipientChannel, uint senderChannel,
@@ -1175,15 +1249,23 @@ namespace ChiselSharp.SSH
                 }
                 IsClosed = true;
 
+                List<TaskCompletionSource<bool>> incomingSignals = new List<TaskCompletionSource<bool>>();
                 lock (_channelsLock)
                 {
                     foreach (var ch in _channels.Values)
                     {
-                        ch.IsOpen = false;
+                        lock (ch.SyncRoot)
+                        {
+                            ch.IsOpen = false;
+                            if (ch.IncomingDataTcs != null)
+                                incomingSignals.Add(ch.IncomingDataTcs);
+                        }
                         try { ch.IncomingData.CompleteAdding(); } catch { }
                     }
                     _channels.Clear();
                 }
+                foreach (var signal in incomingSignals)
+                    signal.TrySetResult(true);
             }
         }
     }

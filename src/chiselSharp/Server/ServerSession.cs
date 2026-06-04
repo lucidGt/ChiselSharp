@@ -25,6 +25,7 @@ namespace ChiselSharp.Server
         private SshTransport _transport;
         private SshConnection _connection;
         private bool _disposed;
+        private const int PipeDrainTimeoutMs = 2000;
 
         private uint _sessionChannelId;
         private Dictionary<string, string> _envVars;
@@ -659,7 +660,7 @@ namespace ChiselSharp.Server
                 // Bidirectional pipe between TCP connection and SSH channel
                 NetworkStream stream = tcpClient.GetStream();
                 Task task1 = PipeTcpToSsh(stream, channelId);
-                Task task2 = Compat.RunLong(delegate { return PipeSshToTcp(channelId, stream); });
+                Task task2 = PipeSshToTcp(channelId, stream);
                 await WaitForPipeTasks(task1, task2, delegate { try { stream.Close(); } catch { } });
             }
             catch (Exception ex)
@@ -703,7 +704,7 @@ namespace ChiselSharp.Server
 
                 // Bidirectional pipe between SSH channel and TCP connection
                 NetworkStream stream = tcpClient.GetStream();
-                Task task1 = Compat.RunLong(delegate { return PipeSshToTcp(localChannelId, stream); });
+                Task task1 = PipeSshToTcp(localChannelId, stream);
                 Task task2 = PipeTcpToSsh(stream, localChannelId);
                 await WaitForPipeTasks(task1, task2, delegate { try { stream.Close(); } catch { } });
             }
@@ -756,7 +757,7 @@ namespace ChiselSharp.Server
                 await Compat.ConnectTcpAsync(tcpClient, host, port);
 
                 NetworkStream stream = tcpClient.GetStream();
-                Task task1 = Compat.RunLong(delegate { return PipeSshToTcp(localChannelId, stream); });
+                Task task1 = PipeSshToTcp(localChannelId, stream);
                 Task task2 = PipeTcpToSsh(stream, localChannelId);
                 await WaitForPipeTasks(task1, task2, delegate { try { stream.Close(); } catch { } });
             }
@@ -833,7 +834,7 @@ namespace ChiselSharp.Server
                     await WriteSocksReply(channelStream, 0);
 
                     NetworkStream tcpStream = tcpClient.GetStream();
-                    Task task1 = Compat.RunLong(delegate { return PipeStreamToTcp(channelStream, tcpStream); });
+                    Task task1 = PipeStreamToTcp(channelStream, tcpStream);
                     Task task2 = PipeTcpToSsh(tcpStream, channelId);
                     await WaitForPipeTasks(task1, task2, delegate { try { tcpStream.Close(); } catch { } });
                 }
@@ -967,7 +968,7 @@ namespace ChiselSharp.Server
                 closeTransport();
 
             Task all = Compat.WhenAll(first, second);
-            Task done = await Compat.WhenAny(all, Compat.Delay(2000));
+            Task done = await Compat.WhenAny(all, Compat.Delay(PipeDrainTimeoutMs));
             if (done == all)
             {
                 try { await all; } catch { }
@@ -986,7 +987,7 @@ namespace ChiselSharp.Server
             {
                 while (true)
                 {
-                    byte[] data = _connection.ReceiveChannelData(channelId);
+                    byte[] data = await _connection.ReceiveChannelDataAsync(channelId);
                     if (data == null)
                         break;
                     await stream.WriteAsync(data, 0, data.Length);
@@ -1089,7 +1090,29 @@ namespace ChiselSharp.Server
             public override Task<int> ReadAsync(byte[] buffer, int offset, int count, System.Threading.CancellationToken cancellationToken)
 #endif
             {
-                return Compat.Run(() => Read(buffer, offset, count));
+                return ReadAsyncCore(buffer, offset, count);
+            }
+
+            private async Task<int> ReadAsyncCore(byte[] buffer, int offset, int count)
+            {
+                if (_disposed)
+                    return 0;
+
+                if (_buffer != null && _bufferOffset < _buffer.Length)
+                    return Read(buffer, offset, count);
+
+                byte[] data = await _connection.ReceiveChannelDataAsync(_channelId);
+                if (data == null || data.Length == 0)
+                    return 0;
+
+                int toCopy = count < data.Length ? count : data.Length;
+                Buffer.BlockCopy(data, 0, buffer, offset, toCopy);
+                if (toCopy < data.Length)
+                {
+                    _buffer = data;
+                    _bufferOffset = toCopy;
+                }
+                return toCopy;
             }
 
             public override void Write(byte[] buffer, int offset, int count)

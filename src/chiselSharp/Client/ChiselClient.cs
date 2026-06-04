@@ -26,6 +26,10 @@ namespace ChiselSharp.Client
         private Backoff _backoff;
         private readonly Dictionary<int, TcpListener> _listeners = new Dictionary<int, TcpListener>();
         private readonly object _listenersLock = new object();
+        private const int PipeDrainTimeoutMs = 2000;
+        private const int MaxConcurrentForwardChannels = 32;
+        private readonly AsyncLimiter _forwardChannelLimiter =
+            new AsyncLimiter(MaxConcurrentForwardChannels);
 
         // Raw WebSocket stream for SSH transport.
 
@@ -276,8 +280,10 @@ namespace ChiselSharp.Client
 
         private async Task HandleForwardConnectionAsync(TcpClient tcpClient, RemoteSpec spec)
         {
+            IDisposable permit = null;
             try
             {
+                permit = await _forwardChannelLimiter.EnterAsync();
                 Logger.Debug("Opening chisel channel for " + spec);
                 uint channelId = await _sshConn.OpenChiselAsync(BuildChiselRemote(spec));
                 Logger.Debug("Chisel channel opened: " + channelId);
@@ -285,7 +291,12 @@ namespace ChiselSharp.Client
                 await PipeSshToTcp(channelId, ns);
             }
             catch (Exception ex) { Logger.Debug("Forward conn error: " + ex.Message); }
-            finally { try { tcpClient.Close(); } catch { } }
+            finally
+            {
+                if (permit != null)
+                    permit.Dispose();
+                try { tcpClient.Close(); } catch { }
+            }
         }
 
         private static string BuildChiselRemote(RemoteSpec spec)
@@ -343,7 +354,7 @@ namespace ChiselSharp.Client
                     await WriteSocksReply(channelStream, 0);
 
                     NetworkStream tcpStream = tcpClient.GetStream();
-                    Task fromChannel = Compat.RunLong(delegate { return PipeStreamToTcp(channelStream, tcpStream); });
+                    Task fromChannel = PipeStreamToTcp(channelStream, tcpStream);
                     Task fromTcp = PipeTcpToSsh(tcpStream, channelId);
                     await WaitForPipeTasks(fromChannel, fromTcp, delegate { try { tcpStream.Close(); } catch { } });
                 }
@@ -504,40 +515,28 @@ namespace ChiselSharp.Client
 
         private async Task PipeSshToTcp(uint channelId, NetworkStream tcpStream)
         {
-            var readTask = Compat.RunLong(async () =>
-            {
-                try
-                {
-                    while (true)
-                    {
-                        byte[] data = _sshConn.ReceiveChannelData(channelId);
-                        if (data == null) break;
-                        await tcpStream.WriteAsync(data, 0, data.Length);
-                    }
-                }
-                catch { }
-            });
-
-            var writeTask = Compat.Run(async () =>
-            {
-                byte[] buf = new byte[32768];
-                try
-                {
-                    while (true)
-                    {
-                        int read = await tcpStream.ReadAsync(buf, 0, buf.Length);
-                        if (read == 0) break;
-                        await _sshConn.SendChannelDataAsync(channelId, buf, 0, read);
-                    }
-                }
-                catch { }
-                try { await _sshConn.SendChannelEofAsync(channelId); } catch { }
-            });
-
-            await Compat.WhenAny(readTask, writeTask);
-            try { tcpStream.Close(); } catch { }
-            await WaitForPipeTasks(readTask, writeTask);
+            Task readTask = PipeChannelToTcp(channelId, tcpStream);
+            Task writeTask = PipeTcpToSsh(tcpStream, channelId);
+            await WaitForPipeTasks(readTask, writeTask, delegate { try { tcpStream.Close(); } catch { } });
             try { await _sshConn.CloseChannelAsync(channelId); } catch { }
+        }
+
+        private async Task PipeChannelToTcp(uint channelId, NetworkStream tcpStream)
+        {
+            try
+            {
+                while (true)
+                {
+                    byte[] data = await _sshConn.ReceiveChannelDataAsync(channelId);
+                    if (data == null)
+                        break;
+                    await tcpStream.WriteAsync(data, 0, data.Length);
+                }
+            }
+            catch
+            {
+                // Connection closed or error
+            }
         }
 
         private static async Task WaitForPipeTasks(Task first, Task second)
@@ -552,7 +551,7 @@ namespace ChiselSharp.Client
             if (closeTransport != null)
                 closeTransport();
 
-            Task done = await Compat.WhenAny(all, Compat.Delay(2000));
+            Task done = await Compat.WhenAny(all, Compat.Delay(PipeDrainTimeoutMs));
             if (done == all)
             {
                 try { await all; } catch { }
@@ -622,11 +621,29 @@ namespace ChiselSharp.Client
             public override Task<int> ReadAsync(byte[] buffer, int offset, int count, System.Threading.CancellationToken cancellationToken)
 #endif
             {
-                return Task<int>.Factory.StartNew(
-                    () => Read(buffer, offset, count),
-                    System.Threading.CancellationToken.None,
-                    TaskCreationOptions.LongRunning,
-                    TaskScheduler.Default);
+                return ReadAsyncCore(buffer, offset, count);
+            }
+
+            private async Task<int> ReadAsyncCore(byte[] buffer, int offset, int count)
+            {
+                if (_disposed)
+                    return 0;
+
+                if (_buffer != null && _bufferOffset < _buffer.Length)
+                    return Read(buffer, offset, count);
+
+                byte[] data = await _connection.ReceiveChannelDataAsync(_channelId);
+                if (data == null || data.Length == 0)
+                    return 0;
+
+                int toCopy = count < data.Length ? count : data.Length;
+                Buffer.BlockCopy(data, 0, buffer, offset, toCopy);
+                if (toCopy < data.Length)
+                {
+                    _buffer = data;
+                    _bufferOffset = toCopy;
+                }
+                return toCopy;
             }
 
             public override void Write(byte[] buffer, int offset, int count)
@@ -674,6 +691,73 @@ namespace ChiselSharp.Client
                 _disposed = true;
                 _buffer = null;
                 base.Dispose(disposing);
+            }
+        }
+
+        private sealed class AsyncLimiter
+        {
+            private readonly object _syncRoot = new object();
+            private readonly Queue<TaskCompletionSource<IDisposable>> _waiters =
+                new Queue<TaskCompletionSource<IDisposable>>();
+            private int _available;
+
+            public AsyncLimiter(int limit)
+            {
+                _available = limit;
+            }
+
+            public Task<IDisposable> EnterAsync()
+            {
+                lock (_syncRoot)
+                {
+                    if (_available > 0)
+                    {
+                        _available--;
+                        return Compat.FromResult<IDisposable>(new Releaser(this));
+                    }
+
+                    var waiter = new TaskCompletionSource<IDisposable>();
+                    _waiters.Enqueue(waiter);
+                    return waiter.Task;
+                }
+            }
+
+            private void Release()
+            {
+                TaskCompletionSource<IDisposable> waiter = null;
+                lock (_syncRoot)
+                {
+                    if (_waiters.Count > 0)
+                    {
+                        waiter = _waiters.Dequeue();
+                    }
+                    else
+                    {
+                        _available++;
+                    }
+                }
+
+                if (waiter != null)
+                    waiter.TrySetResult(new Releaser(this));
+            }
+
+            private sealed class Releaser : IDisposable
+            {
+                private AsyncLimiter _owner;
+
+                public Releaser(AsyncLimiter owner)
+                {
+                    _owner = owner;
+                }
+
+                public void Dispose()
+                {
+                    AsyncLimiter owner = _owner;
+                    if (owner == null)
+                        return;
+                    _owner = null;
+                    owner.Release();
+                }
             }
         }
 

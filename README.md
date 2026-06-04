@@ -48,7 +48,12 @@ v4.0 and run in older Windows environments where newer framework APIs may not be
 - Raised TCP listener backlog values for high connection bursts.
 - Raised process ThreadPool minimum worker and IO completion thread counts at startup.
 - Increased `ServicePointManager.DefaultConnectionLimit` for concurrent outbound connections.
-- Moved blocking channel receive loops to long-running tasks to reduce ThreadPool starvation.
+- Replaced per-read blocking channel receive workers with async channel receive notifications.
+- Batches SSH channel window adjustments so short-lived SOCKS connections do not race channel close.
+- Bounds concurrent client-side forward channels to avoid overloading a single native chisel session
+  during large SOCKS request bursts.
+- Moved remaining unavoidable blocking channel receive loops to long-running tasks to reduce
+  ThreadPool starvation.
 - Added pipe-drain behavior before closing SSH channels to reduce close races and invalid-channel
   errors under concurrent load.
 - Enabled `TcpClient.NoDelay` on tunnel sockets where low-latency forwarding matters.
@@ -77,6 +82,7 @@ per scenario:
 - Native client to C# server, forward SOCKS tunnel: passed.
 - C# client to native server, reverse SOCKS tunnel (`R:socks`): passed.
 - Native client to C# server, reverse SOCKS tunnel (`R:socks`): passed.
+- High-burst SOCKS regression tests with 200 concurrent requests across repeated waves: passed.
 
 UDP and TLS/mTLS paths are implemented or parsed in parts of the project, but they have not received
 the same full native interoperability load audit as TCP and SOCKS.

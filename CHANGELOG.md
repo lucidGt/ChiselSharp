@@ -18,7 +18,13 @@
 - Increased TCP listener backlog values to handle bursts of concurrent tunnel connections.
 - Increased runtime ThreadPool minimum worker and IO completion thread counts.
 - Increased `ServicePointManager.DefaultConnectionLimit`.
-- Moved blocking SSH channel receive paths onto long-running tasks to reduce ThreadPool starvation.
+- Replaced hot-path blocking SSH channel receives with async channel receive notifications.
+- Batched SSH channel window adjustment messages to avoid sending late window updates for already
+  closed short-lived channels.
+- Added a client-side forward-channel concurrency limiter so bursty SOCKS clients queue locally
+  instead of overloading one native chisel SSH session.
+- Moved remaining unavoidable blocking SSH channel receive paths onto long-running tasks to reduce
+  ThreadPool starvation.
 - Drained bidirectional pipe tasks before closing SSH channels to reduce close races under load.
 - Adjusted server `--socks5` behavior so it enables SOCKS channel support without creating an
   unrelated default local SOCKS listener.
@@ -55,3 +61,8 @@
   - Native client to C# server forward SOCKS.
   - C# client to native server reverse SOCKS (`R:socks`).
   - Native client to C# server reverse SOCKS (`R:socks`).
+- High-burst SOCKS regression tests passed with 200 concurrent requests across repeated waves for:
+  - C# client to native server forward SOCKS.
+  - C# client to native server reverse SOCKS (`R:socks`).
+  - Native client to C# server reverse SOCKS (`R:socks`).
+  - Native client to C# server forward SOCKS.
